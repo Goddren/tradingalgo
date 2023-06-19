@@ -1,16 +1,16 @@
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest, CryptoQuotesRequest, CryptoTradesRequest
-from alpaca.trading.requests import GetOrdersRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
-from datetime import datetime
 from dateutil.relativedelta import relativedelta
-import json
-import logging
 import config
+import logging
 import asyncio
+import requests
+import pandas as pd
+from datetime import date, datetime
+from ta.volatility import BollingerBands
+from ta.momentum import RSIIndicator
+from alpaca_trade_api.rest import REST, TimeFrame
+import json
+import backtrader as bt
+import backtrader.feeds as btfeeds
 
 # ENABLE LOGGING - options, DEBUG,INFO, WARNING?
 logging.basicConfig(level=logging.INFO,
@@ -18,54 +18,59 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-# Alpaca Trading Client
-trading_client = TradingClient(
-    config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY, paper=True)
+# Alpaca API
+ALPACA_BASE_URL = 'https://paper-api.alpaca.markets'
 
-# Alpaca Market Data Client
-data_client = CryptoHistoricalDataClient()
+HEADERS = {'APCA-API-KEY-ID': config.APCA_API_KEY_ID,
+           'APCA-API-SECRET-KEY': config.APCA_API_SECRET_KEY}
 
-# Trading variables
-trading_pair = 'ETH/USD'
-notional_size = 20000
-spread = 0.00
-total_fees = 0
-buying_price, selling_price = 0.00, 0.00
-buy_order_price, sell_order_price = 0.00, 0.00
 
-buy_order, sell_order = None, None
-current_price = 0.00
-client_order_str = 'scalping'
+# Alpaca client
+client = REST(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
 
-# Wait time between each bar request
-waitTime = 60
+# Trading and Backtesting variables
+trading_pair = 'BTCUSD'
+exchange = 'FTXU'
+one_year_ago = datetime.now() - relativedelta(years=1)
+start_date = str(one_year_ago.date())
+today = date.today()
+today = today.strftime("%Y-%m-%d")
+rsi_upper_bound = 70
+rsi_lower_bound = 30
+bollinger_window = 20
+percent_trade = 0.2
+bar_data = 0
+latest_bar_data = 0
 
-# Time range for the latest bar data
-diff = 5
-
-# Current position of the trading pair on Alpaca
-current_position = 0.00
-
-# Threshold percentage to cut losses (0.5%)
-cut_loss_threshold = 0.005
-
-# Alpaca trading fee is 0.3% (tier based)
-trading_fee = 0.003
+# Wait time between each bar request -> 1 hour (3600 seconds)
+waitTime = 3600
+btc_position = 0
+usd_position = 0
 
 
 async def main():
     '''
-    Main function to get latest asset data and check possible trade conditions
+    Get historical data from Alpaca and calculate RSI and Bollinger Bands.
+    Backtest historical data to determine buy/sell/hold decisions and test performance.
+    After backtesting, plot the results. Then, enter the loop to wait for new data and
+    calculate entry and exit decisions.
     '''
-
-    # closes all position AND also cancels all open orders
-    trading_client.close_all_positions(cancel_orders=True)
-    logger.info("Closed all positions")
+    # Log the current balance of the MATIC token in our Alpaca account
+    logger.info('BTC Position on Alpaca: {0}'.format(get_positions()))
+    # Log the current Cash Balance (USD) in our Alpaca account
+    global usd_position
+    usd_position = float(get_account_details()['cash'])
+    logger.info("USD position on Alpaca: {0}".format(usd_position))
+    # Get the historical data from Alpaca for backtesting
+    await get_crypto_bar_data(trading_pair, start_date, today, exchange)
+    # Add bar_data to a CSV for backtrader
+    bar_data.to_csv('bar_data.csv', index=False)
+    # Create and run a Backtest instance
+    await backtest_returns()
 
     while True:
-        logger.info('----------------------------------------------------')
         l1 = loop.create_task(get_crypto_bar_data(
-            trading_pair))
+            trading_pair, start_date, today, exchange))
         # Wait for the tasks to finish
         await asyncio.wait([l1])
         # Check if any trading condition is met
@@ -74,199 +79,281 @@ async def main():
         await asyncio.sleep(waitTime)
 
 
-async def get_crypto_bar_data(trading_pair):
+async def get_crypto_bar_data(trading_pair, start_date, end_date, exchange):
     '''
-    Get Crypto Bar Data from Alpaca for the last diff minutes
+    Get bar data from Alpaca for a given trading pair and exchange
     '''
-    time_diff = datetime.now() - relativedelta(minutes=diff)
-    logger.info("Getting crypto bar data for {0} from {1}".format(
-        trading_pair, time_diff))
-    # Defining Bar data request parameters
-    request_params = CryptoBarsRequest(
-        symbol_or_symbols=[trading_pair],
-        timeframe=TimeFrame.Minute,
-        start=time_diff
-    )
-    # Get the bar data from Alpaca
-    bars_df = data_client.get_crypto_bars(request_params).df
-    # Calculate the order prices
-    global buying_price, selling_price, current_position
-    buying_price, selling_price = calc_order_prices(bars_df)
+    try:
 
-    if len(get_positions()) > 0:
+        bars = client.get_crypto_bars(
+            trading_pair, TimeFrame.Hour, start=start_date, end=end_date, limit=10000, exchanges=exchange).df
 
-        current_position = float(json.loads(get_positions()[0].json())['qty'])
+        bars = bars.drop(
+            columns=["trade_count", "exchange"], axis=1)
 
-        buy_order = False
+        # Get RSI for the bar data
+        bars = get_rsi(bars)
+        # Get Bollinger Bands for the bar data
+        bars = get_bb(bars)
+        bars = bars.dropna()
+        bars['timestamp'] = bars.index
+
+        # Assigning bar data to global variables
+        global latest_bar_data
+        global bar_data
+        bar_data = bars
+        # The latest bar data is the last bar in the bar data
+        latest_bar_data = bars[-1:]
+    # If there is an error, log it
+    except Exception as e:
+        logger.exception(
+            "There was an issue getting trade quote from Alpaca: {0}".format(e))
+        return False
+
+    return bars
+
+
+async def check_condition():
+    logger.info("Checking BTC position on Alpaca")
+    global btc_position
+    btc_position = float(get_positions())
+    # Log the latest closing price, RSI, and Bollinger Bands
+    logger.info("Checking Buy/Sell conditions for Bollinger bands and RSI")
+    logger.info("Latest Closing Price: {0}".format(
+        latest_bar_data['close'].values[0]))
+    logger.info("Latest Upper BB Value: {0}".format(
+        latest_bar_data['bb_upper'].values[0]))
+    logger.info("Latest MAvg BB Value: {0}".format(
+        latest_bar_data['bb_mavg'].values[0]))
+    logger.info("Latest Lower BB Value: {0}".format(
+        latest_bar_data['bb_lower'].values[0]))
+    logger.info("Latest RSI Value: {0}".format(
+        latest_bar_data['rsi'].values[0]))
+
+    if latest_bar_data.empty:
+        logger.info("Unable to get latest bar data")
+    # If we have a position, bollinger high indicator is 1 and RSI is above the upperbound, then sell
+    if ((latest_bar_data['bb_hi'].values[0] == 1) & (latest_bar_data['rsi'].values[0] > rsi_upper_bound) & (btc_position > 0)):
+        logger.info(
+            "Sell signal: Bollinger bands and RSI are above upper bound")
+        sell_order = await post_alpaca_order(trading_pair, btc_position, 'sell', 'market', 'gtc')
+        if sell_order['status'] == 'accepted':
+            logger.info("Sell order successfully placed for {0} {1}".format(
+                btc_position, trading_pair))
+        elif (sell_order['status'] == 'pending_new'):
+            logger.info("Sell order is pending.")
+            logger.info("BTC Position on Alpaca: {0}".format(get_positions()))
+        else:
+            logger.info("Sell order status: {0}".format(sell_order))
+    # If we do not have a position, bollinger low indicator is 1 and RSI is below the lowerbound, then buy
+    elif ((latest_bar_data['bb_li'].values[0] == 1) & (latest_bar_data['rsi'].values[0] < rsi_lower_bound) & (btc_position == 0)):
+        logger.info("Buy signal: Bollinger bands and RSI are below lower bound")
+        qty_to_buy = (percent_trade * usd_position) / \
+            latest_bar_data['close'].values[0]
+        buy_order = await post_alpaca_order(trading_pair, qty_to_buy, 'buy', 'market', 'gtc')
+        if buy_order['status'] == 'accepted':
+            logger.info("Buy order successfully placed for {0} {1}".format(
+                qty_to_buy, trading_pair))
+        elif (buy_order['status'] == 'pending_new'):
+            logger.info("Buy order is pending.")
+            logger.info("BTC Position on Alpaca: {0}".format(get_positions()))
+        else:
+            logger.info("Buy order status: {0}".format(buy_order))
+    # If we do not meet the above conditions, then we hold till we analyze the next bar
     else:
-        sell_order = False
-    return bars_df
+        logger.info("Hold signal: Bollinger bands and RSI are within bounds")
 
 
-def calc_order_prices(bars_df):
+def get_daily_returns(df):
+    df['daily_returns'] = df['close'].pct_change()
+    return df
 
-    global spread, total_fees, current_price
-    max_high = bars_df['high'].max()
-    min_low = bars_df['low'].min()
-    current_price = bars_df['close'].iloc[-1]
 
-    logger.info("Closing Price: {0}".format(current_price))
-    logger.info("Min Low: {0}".format(min_low))
-    logger.info("Max High: {0}".format(max_high))
+def get_cumulative_return(df):
+    df['cumulative_return'] = df['daily_returns'].add(1).cumprod().sub(1)
+    return df
 
-    # Buying price in 0.2% below the max high
-    selling_price = round(max_high*0.998, 1)
-    # Selling price in 0.2% above the min low
-    buying_price = round(min_low*1.002, 1)
 
-    buying_fee = trading_fee * buying_price
-    selling_fee = trading_fee * selling_price
-    total_fees = round(buying_fee + selling_fee, 1)
+def get_bb(df):
+    # calculate bollinger bands
+    indicator_bb = BollingerBands(
+        close=df["close"], window=bollinger_window, window_dev=2)
+    # Add Bollinger Bands to the dataframe
+    df['bb_mavg'] = indicator_bb.bollinger_mavg()
+    df['bb_upper'] = indicator_bb.bollinger_hband()
+    df['bb_lower'] = indicator_bb.bollinger_lband()
 
-    logger.info("Buying Price: {0}".format(buying_price))
-    logger.info("Selling Price: {0}".format(selling_price))
-    logger.info("Total Fees: {0}".format(total_fees))
+    # Add Bollinger Band high indicator
+    df['bb_hi'] = indicator_bb.bollinger_hband_indicator()
+    # Add Bollinger Band low indicator
+    df['bb_li'] = indicator_bb.bollinger_lband_indicator()
+    return df
 
-    # Calculate the spread
-    spread = round(selling_price - buying_price, 1)
 
-    logger.info(
-        "Spread that can be captured with buying and selling prices: {0}".format(spread))
-
-    return buying_price, selling_price
+def get_rsi(df):
+    indicator_rsi = RSIIndicator(close=df["close"], window=14)
+    df['rsi'] = indicator_rsi.rsi()
+    return df
 
 
 def get_positions():
-    positions = trading_client.get_all_positions()
-
-    return positions
-
-
-def get_open_orders():
-
-    orders = trading_client.get_orders()
-
-    num_orders = len(orders)
-    logger.info("Number of open orders: {0}".format(num_orders))
-
-    global buy_order, sell_order
-
-    for i in range(len(orders)):
-        ord = json.loads(orders[i].json())
-        logger.info("Order type: {0} Order side: {1} Order notional: {2}  Order Symbol: {3} Order Price: {4}".format(
-            ord['type'], ord['side'], ord['notional'], ord['symbol'], ord['limit_price']))
-        if ord['side'] == 'buy':
-            buy_order = True
-        if ord['side'] == 'sell':
-            sell_order = True
-
-    return num_orders
+    '''
+    Get positions on Alpaca
+    '''
+    try:
+        positions = requests.get(
+            '{0}/v2/positions'.format(ALPACA_BASE_URL), headers=HEADERS)
+        logger.info('Alpaca positions reply status code: {0}'.format(
+            positions.status_code))
+        if positions.status_code != 200:
+            logger.info(
+                "Undesirable response from Alpaca! {}".format(positions.json()))
+        if len(positions.json()) != 0:
+            btc_position = positions.json()[0]['qty']
+        else:
+            btc_position = 0
+        logger.info('BTC Position on Alpaca: {0}'.format(btc_position))
+    except Exception as e:
+        logger.exception(
+            "There was an issue getting positions from Alpaca: {0}".format(e))
+    return btc_position
 
 
-async def post_alpaca_order(buy_price, sell_price, side):
+def get_account_details():
+    '''
+    Get Alpaca Trading Account Details
+    '''
+    try:
+        account = requests.get(
+            '{0}/v2/account'.format(ALPACA_BASE_URL), headers=HEADERS)
+        if account.status_code != 200:
+            logger.info(
+                "Undesirable response from Alpaca! {}".format(account.json()))
+            return False
+    except Exception as e:
+        logger.exception(
+            "There was an issue getting account details from Alpaca: {0}".format(e))
+        return False
+    return account.json()
+
+
+# Post an Order to Alpaca
+async def post_alpaca_order(symbol, qty, side, type, time_in_force):
     '''
     Post an order to Alpaca
     '''
-    global buy_order_price, sell_order_price, buy_order, sell_order
     try:
-        if side == 'buy':
-            # print("Buying at: {0}".format(price))
-            limit_order_data = LimitOrderRequest(
-                symbol="ETHUSD",
-                limit_price=buy_price,
-                notional=notional_size,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.GTC)
-            buy_limit_order = trading_client.submit_order(
-                order_data=limit_order_data
-            )
-            buy_order_price = buy_price
-            sell_order_price = sell_price
-            # buy_order = True
+        order = requests.post(
+            '{0}/v2/orders'.format(ALPACA_BASE_URL), headers=HEADERS, json={
+                'symbol': symbol,
+                'qty': qty,
+                'side': side,
+                'type': type,
+                'time_in_force': time_in_force,
+                'client_order_id': 'bb_rsi_strategy'
+            })
+        logger.info('Alpaca order reply status code: {0}'.format(
+            order.status_code))
+        if order.status_code != 200:
             logger.info(
-                "Buy Limit Order placed for ETH/USD at : {0}".format(buy_limit_order.limit_price))
-            return buy_limit_order
-        else:
-            limit_order_data = LimitOrderRequest(
-                symbol="ETHUSD",
-                limit_price=sell_price,
-                notional=notional_size,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC
-            )
-            sell_limit_order = trading_client.submit_order(
-                order_data=limit_order_data
-            )
-            sell_order_price = sell_price
-            buy_order_price = buy_price
-            # sell_order = True
-            logger.info(
-                "Sell Limit Order placed for ETH/USD at : {0}".format(sell_limit_order.limit_price))
-            return sell_limit_order
-
+                "Undesirable response from Alpaca! {}".format(order.json()))
+            return False
     except Exception as e:
         logger.exception(
             "There was an issue posting order to Alpaca: {0}".format(e))
         return False
+    return order.json()
 
 
-async def check_condition():
-    '''
-    Check the market conditions to see what limit orders to place
+# Backtesting strategy
+class BB_RSI_Strategy(bt.Strategy):
+    '''Class to backtest Bollinger Bands and RSI strategy'''
 
-    Strategy:
-    - Only consider placing orders if the spread is greater than the total fees after fees are taken into account
-    - If the spread is greater than the total fees and we do not have a position, then place a buy order
-    - If the spread is greater than the total fees and we have a position, then place a sell order
-    - If we do not have a position, a buy order is in place and the current price is more than price we would have sold at, then close the buy limit order
-    - If we do have a position, a sell order is in place and the current price is less than price we would have bought at, then close the sell limit order
+    def log(self, txt, dt=None):
+        # Logging function for this strategy
+        dt = dt or self.datas[0].datetime.date(0)
+        print('%s, %s' % (dt.isoformat(), txt))
 
-    '''
-    global buy_order, sell_order, current_position, current_price, buying_price, selling_price, spread, total_fees, buy_order_price, sell_order_price
-    get_open_orders()
-    logger.info("Current Position is: {0}".format(current_position))
-    logger.info("Buy Order status: {0}".format(buy_order))
-    logger.info("Sell Order status: {0}".format(sell_order))
-    logger.info("Buy_order_price: {0}".format(buy_order_price))
-    logger.info("Sell_order_price: {0}".format(sell_order_price))
-    # If the spread is less than the fees, do not place an order
-    if spread < total_fees:
-        logger.info(
-            "Spread is less than total fees, Not a profitable opportunity to trade")
-    else:
-        # If we do not have a position, there are no open orders and spread is greater than the total fees, place a limit buy order at the buying price
-        if current_position <= 0.01 and (not buy_order) and current_price > buying_price:
-            buy_limit_order = await post_alpaca_order(buying_price, selling_price, 'buy')
-            sell_order = False
-            if buy_limit_order:  # check some attribute of buy_order to see if it was successful
-                logger.info(
-                    "Placed buy limit order at {0}".format(buying_price))
+    def __init__(self):
+        # Initialize the strategy data and indicators
+        self.dataclose = self.datas[0].close
+        self.bband = bt.indicators.BBands(
+            self.datas[0], period=20)
+        self.rsi = bt.indicators.RSI_SMA(self.data.close, period=14)
 
-        # if we have a position, no open orders and the spread that can be captured is greater than fees, place a limit sell order at the sell_order_price
-        if current_position >= 0.01 and (not sell_order) and current_price < sell_order_price:
-            sell_limit_order = await post_alpaca_order(buying_price, selling_price, 'sell')
-            buy_order = False
-            if sell_limit_order:
-                logger.info(
-                    "Placed sell limit order at {0}".format(selling_price))
+        self.order = None
 
-        # Cutting losses
-        # If we have do not have a position, an open buy order and the current price is above the selling price, cancel the buy limit order
-        logger.info("Threshold price to cancel any buy limit order: {0}".format(
-                    sell_order_price * (1 + cut_loss_threshold)))
-        if current_position <= 0.01 and buy_order and current_price > (sell_order_price * (1 + cut_loss_threshold)):
-            trading_client.cancel_orders()
-            buy_order = False
-            logger.info(
-                "Current price > Selling price. Closing Buy Limit Order, will place again in next check")
-        # If we have do have a position and an open sell order and current price is below the buying price, cancel the sell limit order
-        logger.info("Threshold price to cancel any sell limit order: {0}".format(
-                    buy_order_price * (1 - cut_loss_threshold)))
-        if current_position >= 0.01 and sell_order and current_price < (buy_order_price * (1 - cut_loss_threshold)):
-            trading_client.cancel_orders()
-            sell_order = False
-            logger.info(
-                "Current price < buying price. Closing Sell Limit Order, will place again in next check")
+    def notify_order(self, order):
+        # Notification of an order being submitted/filled
+        if order.status in [order.Submitted, order.Accepted]:
+            # Buy/Sell order submitted/accepted to/by broker - Nothing to do
+            return
+        # If the order has been completed we log it
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log('BUY EXECUTED, %.2f' % order.executed.price)
+            elif order.issell():
+                self.log('SELL EXECUTED, %.2f' % order.executed.price)
+
+        self.order = None
+
+    def next(self):
+        # Simply log the closing price of the series from the reference
+        self.log('Close, %.2f' % self.dataclose[0])
+        if self.order:
+            return
+        # If we do not have a position, the closing price is below the lower
+        # BBand and RSI is lower than the lower bound then we enter a long position (BUY)
+        if not self.position:
+            if self.dataclose[0] < self.bband.lines.bot and self.rsi[0] < rsi_lower_bound:
+                self.order = self.buy()
+                self.log('BUY CREATED, %.2f' % self.dataclose[0])
+        # If we have a position, the closing price is above the upper BBand and RSI is above
+        # the upper bound then we sell our position
+        else:
+            if self.dataclose[0] < self.bband.lines.bot and self.rsi[0] < rsi_lower_bound:
+                self.order = self.sell()
+                self.log('SELL CREATED, %.2f' % self.dataclose[0])
+
+
+async def backtest_returns():
+
+    cerebro = bt.Cerebro()
+    data = btfeeds.GenericCSVData(
+        dataname='bar_data.csv',
+
+        fromdate=datetime(2021, 7, 9, 0, 0, 0, 0),
+        todate=datetime(2022, 7, 8, 0, 0, 0, 0),
+
+        nullvalue=0.0,
+
+        dtformat=('%Y-%m-%d %H:%M:%S%z'),
+        timeframe=bt.TimeFrame.Minutes,
+        compression=60,
+        datetime=12,
+        high=1,
+        low=2,
+        open=0,
+        close=3,
+        volume=4,
+        openinterest=-1,
+        rsi=6,
+        bb_hi=10,
+        bb_li=11
+    )
+    cerebro.broker.set_cash(100000.0)
+    cerebro.addsizer(bt.sizers.PercentSizer, percents=20)
+    cerebro.adddata(data)
+    cerebro.addstrategy(BB_RSI_Strategy)
+    print("Starting Portfolio Value: ${}".format(cerebro.broker.getvalue()))
+
+    cerebro.run()
+
+    print("Final Portfolio Value: ${}".format(cerebro.broker.getvalue()))
+
+    cerebro.plot()
+
+    return
 
 
 loop = asyncio.get_event_loop()
